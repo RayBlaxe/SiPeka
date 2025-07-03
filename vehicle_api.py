@@ -1,5 +1,5 @@
 # backend.py
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import cv2
@@ -12,8 +12,16 @@ import asyncio
 from datetime import datetime
 import threading
 import base64
+import os
+import tempfile
+import shutil
+import logging
 
 app = FastAPI()
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Enable CORS for Next.js frontend
 app.add_middleware(
@@ -44,6 +52,13 @@ class VehicleDetectionAPI:
         # Video capture
         self.cap = None
         self.is_running = False
+        self.current_video_path = None
+        self.video_info = None
+        
+        # Upload directory
+        self.upload_dir = "uploads"
+        if not os.path.exists(self.upload_dir):
+            os.makedirs(self.upload_dir)
         
     def setup_counting_line(self, frame_height, position=0.5):
         self.counting_line = int(frame_height * position)
@@ -142,35 +157,217 @@ class VehicleDetectionAPI:
         frame_base64 = base64.b64encode(buffer).decode('utf-8')
         return frame_base64
     
-    def start_capture(self, source=0):
-        """Start video capture"""
-        self.cap = cv2.VideoCapture(source)
-        if self.cap.isOpened():
-            ret, frame = self.cap.read()
-            if ret:
-                self.setup_counting_line(frame.shape[0])
-            self.is_running = True
-            return True
+    def start_capture(self, video_path=None):
+        """Start video capture from uploaded video file"""
+        try:
+            if not video_path:
+                return False
+                
+            if not os.path.exists(video_path):
+                logger.warning(f"Video file not found: {video_path}")
+                return False
+            
+            self.cap = cv2.VideoCapture(video_path)
+            if self.cap.isOpened():
+                # Get video properties
+                fps = self.cap.get(cv2.CAP_PROP_FPS)
+                frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                duration = frame_count / fps if fps > 0 else 0
+                
+                self.video_info = {
+                    'fps': fps,
+                    'frame_count': frame_count,
+                    'width': width,
+                    'height': height,
+                    'duration': duration
+                }
+                
+                # Test if we can actually read a frame
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    self.setup_counting_line(frame.shape[0])
+                    self.is_running = True
+                    self.current_video_path = video_path
+                    # Reset video to beginning
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    logger.info(f"Successfully opened video: {video_path}")
+                    logger.info(f"Video info: {self.video_info}")
+                    return True
+                else:
+                    logger.warning(f"Video opened but can't read frames: {video_path}")
+                    self.cap.release()
+            else:
+                logger.error(f"Failed to open video: {video_path}")
+                
+        except Exception as e:
+            logger.error(f"Failed to start capture: {e}")
+            if self.cap:
+                self.cap.release()
+                
         return False
+    
+    def upload_video(self, file: UploadFile):
+        """Upload and save video file"""
+        try:
+            # Check file extension
+            allowed_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
+            file_extension = os.path.splitext(file.filename)[1].lower()
+            
+            if file_extension not in allowed_extensions:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Unsupported file format. Allowed: {', '.join(allowed_extensions)}"
+                )
+            
+            # Generate unique filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"video_{timestamp}{file_extension}"
+            file_path = os.path.join(self.upload_dir, filename)
+            
+            # Save uploaded file
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            
+            # Verify the video can be opened
+            test_cap = cv2.VideoCapture(file_path)
+            if not test_cap.isOpened():
+                os.remove(file_path)  # Remove invalid file
+                raise HTTPException(status_code=400, detail="Invalid video file")
+            
+            # Get video info
+            fps = test_cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(test_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(test_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            duration = frame_count / fps if fps > 0 else 0
+            
+            video_info = {
+                'filename': filename,
+                'path': file_path,
+                'fps': fps,
+                'frame_count': frame_count,
+                'width': width,
+                'height': height,
+                'duration': duration,
+                'size_mb': os.path.getsize(file_path) / (1024 * 1024)
+            }
+            
+            test_cap.release()
+            
+            logger.info(f"Video uploaded: {filename}, Size: {video_info['size_mb']} MB")
+            
+            return video_info
+            
+        except Exception as e:
+            logger.error(f"Error uploading video: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
     
     def stop_capture(self):
         """Stop video capture"""
         self.is_running = False
         if self.cap:
             self.cap.release()
+        self.current_video_path = None
+        self.video_info = None
+    
+    def get_uploaded_videos(self):
+        """Get list of uploaded videos"""
+        videos = []
+        if os.path.exists(self.upload_dir):
+            for filename in os.listdir(self.upload_dir):
+                if filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm')):
+                    file_path = os.path.join(self.upload_dir, filename)
+                    file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                    videos.append({
+                        'filename': filename,
+                        'path': file_path,
+                        'size_mb': round(file_size, 2),
+                        'upload_time': datetime.fromtimestamp(os.path.getctime(file_path)).isoformat()
+                    })
+        return videos
+    
+    def delete_video(self, filename):
+        """Delete uploaded video"""
+        file_path = os.path.join(self.upload_dir, filename)
+        if os.path.exists(file_path):
+            # Stop current video if it's the one being deleted
+            if self.current_video_path == file_path:
+                self.stop_capture()
+            os.remove(file_path)
+            logger.info(f"Video deleted: {filename}")
+            return True
+        return False
 
 # Initialize detector
 detector = VehicleDetectionAPI()
 
 @app.get("/")
 async def root():
-    return {"message": "Vehicle Detection API"}
+    return {"message": "Vehicle Detection API - Video Upload Version"}
+
+@app.post("/upload_video")
+async def upload_video(file: UploadFile = File(...)):
+    """Upload a video file for processing"""
+    video_info = detector.upload_video(file)
+    return {"status": "uploaded", "video_info": video_info}
+
+@app.get("/videos")
+async def get_videos():
+    """Get list of uploaded videos"""
+    videos = detector.get_uploaded_videos()
+    return {"videos": videos}
+
+@app.delete("/videos/{filename}")
+async def delete_video(filename: str):
+    """Delete an uploaded video"""
+    if detector.delete_video(filename):
+        return {"status": "deleted", "filename": filename}
+    else:
+        raise HTTPException(status_code=404, detail="Video not found")
 
 @app.post("/start")
-async def start_detection(source: int = 0):
-    if detector.start_capture(source):
-        return {"status": "started"}
-    return {"status": "error", "message": "Failed to start capture"}
+async def start_detection(request: dict):
+    """Start detection with uploaded video"""
+    logger.info(f"Received start request: {request}")
+    
+    video_filename = request.get("video_filename")
+    
+    if not video_filename:
+        logger.error("No video filename provided in request")
+        return {
+            "status": "error", 
+            "message": "No video filename provided"
+        }
+    
+    logger.info(f"Attempting to start detection with video: {video_filename}")
+    
+    video_path = os.path.join(detector.upload_dir, video_filename)
+    logger.info(f"Video path: {video_path}")
+    
+    if not os.path.exists(video_path):
+        logger.error(f"Video file not found: {video_path}")
+        return {
+            "status": "error", 
+            "message": f"Video file not found: {video_filename}"
+        }
+    
+    if detector.start_capture(video_path):
+        logger.info(f"Successfully started detection for: {video_filename}")
+        return {
+            "status": "started", 
+            "video_filename": video_filename,
+            "video_info": detector.video_info
+        }
+    else:
+        logger.error(f"Failed to start detection for: {video_filename}")
+        available_videos = detector.get_uploaded_videos()
+        return {
+            "status": "error", 
+            "message": f"Failed to start processing video: {video_filename}",
+            "available_videos": available_videos
+        }
 
 @app.post("/stop")
 async def stop_detection():
@@ -182,6 +379,8 @@ async def get_stats():
     return {
         "counts": detector.vehicle_count,
         "is_running": detector.is_running,
+        "current_video": detector.current_video_path,
+        "video_info": detector.video_info,
         "reports": detector.reports[-5:]  # Last 5 reports
     }
 
@@ -195,10 +394,10 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
     try:
-        while detector.is_running:
-            if detector.cap and detector.cap.isOpened():
+        while True:
+            if detector.is_running and detector.cap and detector.cap.isOpened():
                 ret, frame = detector.cap.read()
-                if ret:
+                if ret and frame is not None:
                     # Process frame
                     processed_frame = detector.process_frame(frame)
                     
@@ -209,11 +408,31 @@ async def websocket_endpoint(websocket: WebSocket):
                         "counts": detector.vehicle_count,
                         "timestamp": datetime.now().isoformat()
                     })
+                else:
+                    # Camera disconnected or error
+                    await websocket.send_json({
+                        "error": "Camera disconnected",
+                        "counts": detector.vehicle_count,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    break
+            else:
+                # No camera running, send status update
+                await websocket.send_json({
+                    "status": "waiting",
+                    "counts": detector.vehicle_count,
+                    "timestamp": datetime.now().isoformat()
+                })
                     
             await asyncio.sleep(0.033)  # ~30 FPS
             
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}")
+        await websocket.send_json({
+            "error": str(e),
+            "counts": detector.vehicle_count,
+            "timestamp": datetime.now().isoformat()
+        })
     finally:
         await websocket.close()
 
