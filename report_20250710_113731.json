@@ -1,0 +1,14 @@
+{
+  "timestamp": "2025-07-10T11:37:31.606309",
+  "duration_minutes": 1.0,
+  "vehicle_count": {
+    "total": 11,
+    "incoming": 11,
+    "outgoing": 0
+  },
+  "average_per_minute": {
+    "total": 11.0,
+    "incoming": 11.0,
+    "outgoing": 0.0
+  }
+}
