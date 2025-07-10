@@ -263,7 +263,7 @@ export default function VehicleDetection() {
 
   return (
     <div className="container mx-auto p-4 max-w-6xl">
-      <h1 className="text-3xl font-bold mb-6">Vehicle Detection System</h1>
+      <h1 className="text-3xl font-bold mb-6">SiPeka - Sistem Penghitung Kendaraan</h1>
       
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
         <Card className="lg:col-span-2">
